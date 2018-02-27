@@ -1,10 +1,11 @@
+use std::cmp;
 use std::marker::PhantomData;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use std::time::Duration;
 
-use http;
+use http::{self, header, uri};
 use tokio_core::reactor::Handle;
 use tower;
 use tower_h2;
@@ -42,11 +43,21 @@ pub struct BindProtocol<C, B> {
     protocol: Protocol,
 }
 
-/// Mark whether to use HTTP/1 or HTTP/2
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+/// Protocol portion of the `Recognize` key for a request.
+///
+/// This marks whether to use HTTP/2 or HTTP/1.x for a request. In
+/// the case of HTTP/1.x requests, it also stores a "host" key to ensure
+/// that each host receives its own connection.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Protocol {
-    Http1,
+    Http1(Host),
     Http2
+}
+
+#[derive(Clone, Debug, Eq, Hash)]
+pub enum Host {
+    Authority(uri::Authority),
+    NoAuthority,
 }
 
 pub type Service<B> = Reconnect<NewHttp<B>>;
@@ -59,6 +70,12 @@ pub type Client<B> = transparency::Client<
     sensor::Connect<transport::TimeoutConnect<transport::Connect>>,
     B,
 >;
+
+pub fn request_orig_dst<B>(req: &http::Request<B>) -> Option<SocketAddr> {
+    req.extensions()
+        .get::<Arc<ctx::transport::Server>>().map(AsRef::as_ref)
+        .and_then(ctx::transport::Server::orig_dst_if_not_local)
+}
 
 impl<B> Bind<(), B> {
     pub fn new(executor: Handle) -> Self {
@@ -139,7 +156,7 @@ impl<B> Bind<Arc<ctx::Proxy>, B>
 where
     B: tower_h2::Body + 'static,
 {
-    pub fn bind_service(&self, addr: &SocketAddr, protocol: Protocol) -> Service<B> {
+    pub fn bind_service(&self, addr: &SocketAddr, protocol: &Protocol) -> Service<B> {
         trace!("bind_service addr={}, protocol={:?}", addr, protocol);
         let client_ctx = ctx::transport::Client::new(
             &self.ctx,
@@ -196,7 +213,50 @@ where
     type BindError = ();
 
     fn bind(&self, addr: &SocketAddr) -> Result<Self::Service, Self::BindError> {
-        Ok(self.bind.bind_service(addr, self.protocol))
+        Ok(self.bind.bind_service(addr, &self.protocol))
     }
 }
 
+// ===== impl Protocol =====
+
+
+impl<'a, B> From<&'a http::Request<B>> for Protocol {
+    fn from(req: &'a http::Request<B>) -> Protocol {
+        if req.version() == http::Version::HTTP_2 {
+            return Protocol::Http2
+        }
+
+        // If the request has an authority part, use that as the host part of
+        // the key for an HTTP/1.x request.
+        let host = req.uri().authority_part()
+            .cloned()
+            .or_else(|| {
+                // No authority part in the request URI, so try and use the
+                // Host: header value, if one is present and it can be parsed
+                // as an Authority.
+                    req.headers().get(header::HOST)
+                        .and_then(|header| {
+                            header.to_str().ok()
+                                .and_then(|header|
+                                    header.parse::<uri::Authority>().ok())
+                        })
+                })
+            .map(Host::Authority)
+            .unwrap_or_else(|| Host::NoAuthority);
+
+        Protocol::Http1(host)
+    }
+}
+
+// ===== impl Host =====
+
+impl cmp::PartialEq for Host {
+    // Override the equality rules for `Host` so that the `NoAuthority` case
+    // is *never* equal, even to other `NoAuthority` values.
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (&Host::Authority(ref a), &Host::Authority(ref b)) => a == b,
+            _ => false,
+        }
+    }
+}
