@@ -268,14 +268,12 @@ fn tcp_connections_close_if_client_closes() {
 
                     tokio_io::io::write_all(sock, msg2.as_bytes())
                 }).and_then(|(sock, _)| {
-
                     // lets read again, but we should get eof
                     tokio_io::io::read(sock, [0; 16])
                 })
-                .and_then(move |(_sock, _vec, n)| {
+                .map(move |(_sock, _vec, n)| {
                     assert_eq!(n, 0);
                     tx.send(()).unwrap();
-                    Ok(())
                 })
                 .map_err(|e| panic!("tcp server error: {}", e))
         })
